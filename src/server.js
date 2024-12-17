@@ -35,6 +35,10 @@ app.use(express.json({ limit: "50mb" }));
 const tempDir = path.join(__dirname, "temp");
 fs.ensureDirSync(tempDir);
 
+app.get("/", (req, res) => {
+  res.send("What do you call a fake noodle? An impasta!");
+});
+
 app.post("/export", async (req, res) => {
   const {
     format = "mp4",
