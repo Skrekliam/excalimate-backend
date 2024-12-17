@@ -39,10 +39,14 @@ app.post("/export", async (req, res) => {
   const {
     format = "mp4",
     renderData,
-    wait = 3000,
+    wait = 1000,
     duration = 1000,
     fps = 60,
   } = req.body;
+
+  if (duration > process.env.MAX_TIME_TO_RECORD) {
+    res.status(400).send("Duration is too long");
+  }
 
   logger.info("Starting export process", { format, wait, duration, fps });
 
@@ -69,7 +73,7 @@ app.post("/export", async (req, res) => {
       const recorder = new PuppeteerScreenRecorder(page, { fps });
 
       await page.goto(url);
-      logger.info("Navigation complete", { url });
+      logger.info("Navigation complete");
 
       await recorder.start(outputPathMP4);
       await new Promise((r) => setTimeout(r, duration));
