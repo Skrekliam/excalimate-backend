@@ -8,12 +8,62 @@ const exec = util.promisify(require("child_process").exec);
 const winston = require("winston");
 require("dotenv").config();
 
+// Add rate limiter configuration
+const RATE_LIMIT = {
+  windowMs: 60 * 1000, // 1 minute window
+  maxRequests: 2, // max 10 requests per window
+};
+
+// Store IP request counts
+const requestCounts = new Map();
+
+// Rate limiter middleware
+const rateLimiter = (req, res, next) => {
+  const reqLogger = getLogger(req);
+  const ip = req.ip || req.connection.remoteAddress;
+  const now = Date.now();
+
+  // Get or create IP entry
+  let ipData = requestCounts.get(ip) || {
+    count: 0,
+    resetTime: now + RATE_LIMIT.windowMs,
+  };
+
+  // Reset count if window has passed
+  if (now >= ipData.resetTime) {
+    ipData = { count: 0, resetTime: now + RATE_LIMIT.windowMs };
+  }
+
+  // Increment count and check limit
+  ipData.count++;
+  requestCounts.set(ip, ipData);
+
+  // Check if limit exceeded
+  if (ipData.count > RATE_LIMIT.maxRequests) {
+    reqLogger.warn("Rate limit exceeded", { count: ipData.count });
+    return res.status(429).send("Too many requests");
+  }
+
+  next();
+};
+
+// Create a custom format that includes IP address
+const logFormat = winston.format.printf(
+  ({ level, message, timestamp, ip, ...meta }) => {
+    const ipInfo = ip ? `[${ip}] ` : "";
+    return `${timestamp} ${level}: ${ipInfo}${message} ${
+      Object.keys(meta).length ? JSON.stringify(meta) : ""
+    }`;
+  }
+);
+
 // Configure logger
 const logger = winston.createLogger({
   level: "info",
   format: winston.format.combine(
     winston.format.timestamp(),
-    winston.format.json()
+    winston.format.json(),
+    logFormat
   ),
   transports: [
     new winston.transports.File({ filename: "error.log", level: "error" }),
@@ -27,6 +77,17 @@ const logger = winston.createLogger({
   ],
 });
 
+// Create a wrapper function to include IP in logs
+const getLogger = (req) => {
+  const ip = req.ip || req.connection.remoteAddress;
+  return {
+    info: (message, meta = {}) => logger.info(message, { ...meta, ip }),
+    error: (message, meta = {}) => logger.error(message, { ...meta, ip }),
+    warn: (message, meta = {}) => logger.warn(message, { ...meta, ip }),
+    debug: (message, meta = {}) => logger.debug(message, { ...meta, ip }),
+  };
+};
+
 const UI_APP_URL = process.env.UI_APP_URL;
 
 const app = express();
@@ -39,7 +100,8 @@ app.get("/", (req, res) => {
   res.send("What do you call a fake noodle? An impasta!");
 });
 
-app.post("/export", async (req, res) => {
+app.post("/export", rateLimiter, async (req, res) => {
+  const reqLogger = getLogger(req);
   const {
     format = "mp4",
     renderData,
@@ -49,22 +111,29 @@ app.post("/export", async (req, res) => {
   } = req.body;
 
   if (duration > process.env.MAX_TIME_TO_RECORD) {
-    res.status(400).send("Duration is too long");
+    reqLogger.error("Duration is too long", {
+      duration,
+      maxTimeToRecord: process.env.MAX_TIME_TO_RECORD,
+    });
+    return res.status(400).send("Duration is too long");
   }
 
-  logger.info("Starting export process", { format, wait, duration, fps });
+  reqLogger.info("Starting export process", { format, wait, duration, fps });
 
   try {
     const exportId = Date.now().toString();
     const exportDir = path.join(tempDir, exportId);
     fs.ensureDirSync(exportDir);
-    logger.debug("Created export directory", { exportDir });
+    reqLogger.debug("Created export directory", { exportDir });
 
     const url = `${UI_APP_URL}/render?wait=${wait}#${renderData}`;
 
     const outputPathMP4 = path.join(exportDir, `output.mp4`);
     const outputPathGIF = path.join(exportDir, `output.gif`);
-    const browser = await puppeteer.launch({ headless: true });
+    const browser = await puppeteer.launch({
+      headless: true,
+      args: ["--no-sandbox", "--disable-setuid-sandbox"],
+    });
     try {
       const page = await browser.newPage();
       await page.setViewport({
@@ -72,48 +141,51 @@ app.post("/export", async (req, res) => {
         height: 1080,
         deviceScaleFactor: 2,
       });
-      logger.debug("Browser page initialized");
+      reqLogger.debug("Browser page initialized");
 
       const recorder = new PuppeteerScreenRecorder(page, { fps });
 
       await page.goto(url);
-      logger.info("Navigation complete");
+      reqLogger.info("Navigation complete");
 
       await recorder.start(outputPathMP4);
       await new Promise((r) => setTimeout(r, duration));
       await recorder.stop();
-      logger.info("Recording completed", { outputPathMP4 });
+      reqLogger.info("Recording completed", { outputPathMP4 });
 
       if (format === "gif") {
-        logger.info("Starting GIF conversion");
+        reqLogger.info("Starting GIF conversion");
         await exec(
           `ffmpeg -i ${outputPathMP4} -r ${fps} -qscale 0 ${outputPathGIF}`
         );
-        logger.info("GIF conversion completed", { outputPathGIF });
+        reqLogger.info("GIF conversion completed", { outputPathGIF });
       }
     } catch (e) {
-      logger.error("Error during recording", {
+      reqLogger.error("Error during recording", {
         error: e.message,
         stack: e.stack,
       });
       throw e;
     } finally {
       await browser.close();
-      logger.debug("Browser closed");
+      reqLogger.debug("Browser closed");
     }
 
     res.sendFile(
       format === "gif" ? outputPathGIF : outputPathMP4,
       async (err) => {
         if (err) {
-          logger.error("Error sending file", { error: err.message });
+          reqLogger.error("Error sending file", { error: err.message });
         }
         await fs.remove(exportDir);
-        logger.debug("Cleaned up export directory", { exportDir });
+        reqLogger.debug("Cleaned up export directory", { exportDir });
       }
     );
   } catch (error) {
-    logger.error("Export failed", { error: error.message, stack: error.stack });
+    reqLogger.error("Export failed", {
+      error: error.message,
+      stack: error.stack,
+    });
     res.status(500).json({ error: "Export failed" });
   }
 });
