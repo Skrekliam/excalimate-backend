@@ -7,6 +7,7 @@ const util = require("util");
 const exec = util.promisify(require("child_process").exec);
 const winston = require("winston");
 require("dotenv").config();
+const crypto = require("crypto");
 
 // Add rate limiter configuration
 const RATE_LIMIT = {
@@ -96,6 +97,8 @@ app.use(express.json({ limit: "50mb" }));
 const tempDir = path.join(__dirname, "temp");
 fs.ensureDirSync(tempDir);
 
+// app.use("/temp", express.static(tempDir));
+
 app.get("/", (req, res) => {
   res.send("What do you call a fake noodle? An impasta!");
 });
@@ -121,7 +124,7 @@ app.post("/export", rateLimiter, async (req, res) => {
   reqLogger.info("Starting export process", { format, wait, duration, fps });
 
   try {
-    const exportId = Date.now().toString();
+    const exportId = crypto.randomBytes(16).toString("hex");
     const exportDir = path.join(tempDir, exportId);
     fs.ensureDirSync(exportDir);
     reqLogger.debug("Created export directory", { exportDir });
@@ -171,16 +174,25 @@ app.post("/export", rateLimiter, async (req, res) => {
       reqLogger.debug("Browser closed");
     }
 
-    res.sendFile(
-      format === "gif" ? outputPathGIF : outputPathMP4,
-      async (err) => {
-        if (err) {
-          reqLogger.error("Error sending file", { error: err.message });
+    res.json({
+      exportId,
+      expiresIn: "5 minutes", // Optional: inform client about expiration
+    });
+
+    // Set up automatic cleanup after 1 hour in case file is never downloaded
+    setTimeout(async () => {
+      try {
+        if (await fs.pathExists(exportDir)) {
+          await fs.remove(exportDir);
+          reqLogger.debug("Cleaned up expired export directory", { exportDir });
         }
-        await fs.remove(exportDir);
-        reqLogger.debug("Cleaned up export directory", { exportDir });
+      } catch (error) {
+        reqLogger.error("Error cleaning up expired directory", {
+          error: error.message,
+          exportDir,
+        });
       }
-    );
+    }, 5 * 60 * 1000); // 5 minutes timeout
   } catch (error) {
     reqLogger.error("Export failed", {
       error: error.message,
@@ -188,6 +200,64 @@ app.post("/export", rateLimiter, async (req, res) => {
     });
     res.status(500).json({ error: "Export failed" });
   }
+});
+
+// Update the temp route to properly serve and then delete the file
+app.get("/temp/:exportId/*", async (req, res, next) => {
+  const reqLogger = getLogger(req);
+  const { exportId } = req.params;
+  const exportDir = path.join(tempDir, exportId);
+  const filePath = path.join(tempDir, req.params.exportId, req.params[0]);
+
+  // Check if file exists
+  if (!fs.existsSync(filePath)) {
+    reqLogger.error("File not found", { filePath });
+    return res.status(404).send("File not found");
+  }
+
+  reqLogger.info("Starting file download", { filePath });
+  reqLogger.debug("Directory to be deleted after download", {
+    exportDir,
+    exists: fs.existsSync(exportDir),
+    contents: fs.readdirSync(exportDir),
+  });
+
+  res.download(filePath, async (err) => {
+    if (err) {
+      reqLogger.error("Error downloading file", { error: err.message });
+      return next(err);
+    }
+
+    try {
+      // Wait a brief moment to ensure file handles are closed
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      // Use fs-extra's remove instead of removeSync
+      await fs.remove(exportDir);
+
+      // Verify deletion
+      const stillExists = fs.existsSync(exportDir);
+      reqLogger.info("Deletion result", {
+        exportDir,
+        stillExists,
+        contents: stillExists ? fs.readdirSync(exportDir) : [],
+      });
+
+      if (stillExists) {
+        reqLogger.warn("Directory still exists after deletion attempt");
+      } else {
+        reqLogger.info("Successfully deleted export directory after download", {
+          exportDir,
+        });
+      }
+    } catch (error) {
+      reqLogger.error("Error cleaning up directory after download", {
+        error: error.message,
+        stack: error.stack,
+        exportDir,
+      });
+    }
+  });
 });
 
 const PORT = process.env.PORT || 8000;
