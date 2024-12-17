@@ -1,3 +1,6 @@
 node_modules/
 src/temp
 .env
+combined.log
+error.log
+

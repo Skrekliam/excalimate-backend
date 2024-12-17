@@ -5,7 +5,27 @@ const path = require("path");
 const { PuppeteerScreenRecorder } = require("puppeteer-screen-recorder");
 const util = require("util");
 const exec = util.promisify(require("child_process").exec);
+const winston = require("winston");
 require("dotenv").config();
+
+// Configure logger
+const logger = winston.createLogger({
+  level: "info",
+  format: winston.format.combine(
+    winston.format.timestamp(),
+    winston.format.json()
+  ),
+  transports: [
+    new winston.transports.File({ filename: "error.log", level: "error" }),
+    new winston.transports.File({ filename: "combined.log" }),
+    new winston.transports.Console({
+      format: winston.format.combine(
+        winston.format.colorize(),
+        winston.format.simple()
+      ),
+    }),
+  ],
+});
 
 const UI_APP_URL = process.env.UI_APP_URL;
 
@@ -24,10 +44,13 @@ app.post("/export", async (req, res) => {
     fps = 60,
   } = req.body;
 
+  logger.info("Starting export process", { format, wait, duration, fps });
+
   try {
     const exportId = Date.now().toString();
     const exportDir = path.join(tempDir, exportId);
     fs.ensureDirSync(exportDir);
+    logger.debug("Created export directory", { exportDir });
 
     const url = `${UI_APP_URL}/render?wait=${wait}#${renderData}`;
 
@@ -41,43 +64,53 @@ app.post("/export", async (req, res) => {
         height: 1080,
         deviceScaleFactor: 2,
       });
+      logger.debug("Browser page initialized");
 
       const recorder = new PuppeteerScreenRecorder(page, { fps });
 
       await page.goto(url);
+      logger.info("Navigation complete", { url });
 
       await recorder.start(outputPathMP4);
       await new Promise((r) => setTimeout(r, duration));
       await recorder.stop();
+      logger.info("Recording completed", { outputPathMP4 });
 
       if (format === "gif") {
+        logger.info("Starting GIF conversion");
         await exec(
           `ffmpeg -i ${outputPathMP4} -r ${fps} -qscale 0 ${outputPathGIF}`
         );
+        logger.info("GIF conversion completed", { outputPathGIF });
       }
     } catch (e) {
-      console.log(e);
+      logger.error("Error during recording", {
+        error: e.message,
+        stack: e.stack,
+      });
+      throw e;
     } finally {
       await browser.close();
+      logger.debug("Browser closed");
     }
 
-    // Send the file
     res.sendFile(
       format === "gif" ? outputPathGIF : outputPathMP4,
       async (err) => {
         if (err) {
-          console.error("Error sending file:", err);
+          logger.error("Error sending file", { error: err.message });
         }
         await fs.remove(exportDir);
+        logger.debug("Cleaned up export directory", { exportDir });
       }
     );
   } catch (error) {
-    console.error("Export error:", error);
+    logger.error("Export failed", { error: error.message, stack: error.stack });
     res.status(500).json({ error: "Export failed" });
   }
 });
 
 const PORT = process.env.PORT || 8000;
 app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+  logger.info(`Server running on port ${PORT}`);
 });
